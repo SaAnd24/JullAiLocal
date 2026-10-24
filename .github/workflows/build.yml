@@ -1,0 +1,166 @@
+name: Compilar APK desde ZIP (JullAI Local)
+
+# Se activa cuando subes un .zip al repositorio (en cualquier carpeta) o a mano con "Run workflow".
+# Descomprime el ZIP, localiza el proyecto Gradle dentro y compila el APK de depuración.
+on:
+  push:
+    paths:
+      - "**.zip"
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Ruta del ZIP en el repositorio (vacío = el último ZIP subido)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-zip-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Localizar el ZIP
+        shell: bash
+        env:
+          INPUT_ZIP: ${{ github.event.inputs.zip_path }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          ZIP=""
+
+          # 1) Ruta indicada a mano
+          if [ -n "${INPUT_ZIP:-}" ]; then
+            ZIP="$INPUT_ZIP"
+          fi
+
+          # 2) ZIP añadido/modificado en este push
+          if [ -z "$ZIP" ] && [ -n "${BEFORE:-}" ] && ! echo "$BEFORE" | grep -qE '^0+$'; then
+            ZIP="$(git diff --name-only --diff-filter=AM "$BEFORE" "$GITHUB_SHA" -- '*.zip' | tail -n 1 || true)"
+          fi
+
+          # 3) Último commit que tocó un ZIP
+          if [ -z "$ZIP" ]; then
+            ZIP="$(git log -1 --name-only --diff-filter=AM --pretty=format: -- '*.zip' | grep -m1 '\.zip$' || true)"
+          fi
+
+          if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+            echo "::error::No encontré ningún ZIP en el repositorio. Sube uno o indica la ruta en 'Run workflow'."
+            exit 1
+          fi
+
+          echo "ZIP encontrado: $ZIP"
+          echo "ZIP_PATH=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Descomprimir el ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/proyecto"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+          unzip -q -o "$ZIP_PATH" -d "$OUT" -x "__MACOSX/*" "*/.DS_Store"
+
+          # Raíz del proyecto = carpeta más superficial que tenga settings.gradle(.kts)
+          SETTINGS="$(find "$OUT" -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) \
+                        -not -path '*/node_modules/*' | awk '{ print length($0) " " $0 }' | sort -n | head -n1 | cut -d' ' -f2-)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::El ZIP no contiene settings.gradle(.kts); no es un proyecto Gradle/Android."
+            exit 1
+          fi
+          ROOT="$(dirname "$SETTINGS")"
+          echo "Proyecto en: $ROOT"
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+          ls -la "$ROOT"
+
+      - name: Instalar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1"
+
+      - name: Instalar Gradle 8.14.3
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      # Comprobación rápida del esquema (solo si el proyecto la incluye)
+      - name: Comprobar esquema y consultas (SQLite)
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f tools/verify/check_schema.py ]; then
+            python3 tools/verify/check_schema.py 2>&1 | tee schema-check.log
+          else
+            echo "Sin tools/verify/check_schema.py; se omite."
+          fi
+
+      - name: Descargar llama.cpp (versión fija)
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f tools/fetch_llama.sh ]; then
+            bash tools/fetch_llama.sh
+          else
+            echo "Sin tools/fetch_llama.sh; se omite."
+          fi
+
+      # Primero se compila y se sube el APK: lo tienes aunque alguna prueba falle.
+      - name: Compilar APK de depuración
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee gradle-build.log
+          else
+            gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee gradle-build.log
+          fi
+
+      - name: Subir APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JullAI-Local-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Pruebas unitarias
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          if [ -f ./gradlew ]; then
+            ./gradlew --no-daemon --stacktrace testDebugUnitTest 2>&1 | tee gradle-tests.log
+          else
+            gradle --no-daemon --stacktrace testDebugUnitTest 2>&1 | tee gradle-tests.log
+          fi
+
+      - name: Subir registros y resultados (siempre)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: registros-de-compilacion
+          path: |
+            ${{ env.PROJECT_DIR }}/gradle-tests.log
+            ${{ env.PROJECT_DIR }}/gradle-build.log
+            ${{ env.PROJECT_DIR }}/schema-check.log
+            ${{ env.PROJECT_DIR }}/app/build/reports/tests/
+            ${{ env.PROJECT_DIR }}/app/build/reports/problems/
+            ${{ env.PROJECT_DIR }}/app/schemas/
+          if-no-files-found: ignore
